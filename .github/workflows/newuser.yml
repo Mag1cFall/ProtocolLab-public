@@ -1,0 +1,295 @@
+name: newuser
+
+on:
+  push:
+    branches: [newuser]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解开 Lab 文件
+        run: node .github/lab.mjs open
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - name: 解压产品源码
+        run: |
+          mkdir product
+          tar -xzf product.tar.gz -C product
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: 构建前端
+        working-directory: product/web
+        run: |
+          npm ci
+          npx vp build
+      - uses: ./product/.github/actions/static-libraries
+        if: hashFiles('spidermonkey/*.tar.gz') == ''
+        with:
+          target: linux-amd64
+      - uses: ./product/.github/actions/static-libraries
+        if: hashFiles('spidermonkey/*.tar.gz') == ''
+        with:
+          target: linux-amd64-gnu
+      - name: 使用传入的 SpiderMonkey 静态库
+        if: hashFiles('spidermonkey/*.tar.gz') != ''
+        run: |
+          libwebp=$(sed -nE 's/^ *LIBWEBP: ([^ ]+)/\1/p' product/.github/actions/static-libraries/action.yml)
+          for target in linux-amd64 linux-amd64-gnu; do
+            mkdir -p "$RUNNER_TEMP/spidermonkey/$target" "$RUNNER_TEMP/libwebp/$target"
+            tar -xzf "spidermonkey/spidermonkey-$target.tar.gz" -C "$RUNNER_TEMP/spidermonkey/$target"
+            curl -fsSL "https://github.com/Mag1cFall/libwebp/releases/download/$libwebp/libwebp-$libwebp-$target.tar.gz" | tar -xz -C "$RUNNER_TEMP/libwebp/$target"
+          done
+      - name: 安装桌面版构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config file libgtk-3-dev libwebkit2gtk-4.1-dev glib-networking ibus-gtk3 fcitx5-frontend-gtk3
+      - name: 按 build.yml 打包 v0.0.1 与 v0.0.2
+        working-directory: product
+        run: |
+          sed 's#https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest#http://127.0.0.1:2171/release.json#' internal/app/update.go > ../update.go
+          grep -q 127.0.0.1:2171 ../update.go
+          printf '{"Replace":{"%s":"%s"}}' "$PWD/internal/app/update.go" "$(cd .. && pwd)/update.go" > ../overlay.json
+          go install -tags gtk3 github.com/wailsapp/wails/v3/cmd/wails3@v3.1.0
+          mkdir -p ../packages ../cli bin dist
+          for version in v0.0.1 v0.0.2; do
+            link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$version"
+            name="aistudio2api-$version-linux-amd64"
+            mkdir -p "../cli/$name"
+            CGO_ENABLED=1 CC="zig cc -target x86_64-linux-musl" CXX="zig c++ -target x86_64-linux-musl" \
+              CGO_CPPFLAGS="-I$RUNNER_TEMP/spidermonkey/linux-amd64/include -I$RUNNER_TEMP/libwebp/linux-amd64/include" CGO_LDFLAGS="-L$RUNNER_TEMP/spidermonkey/linux-amd64/lib -L$RUNNER_TEMP/libwebp/linux-amd64/lib" \
+              GOOS=linux GOARCH=amd64 go build -overlay ../overlay.json -mod=readonly -trimpath -tags netgo,osusergo \
+              -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all -Wl,--gc-sections' $link" -o "../cli/$name/aistudio2api" ./cmd/aistudio2api
+            tar -cf - -C ../cli "$name" | gzip -9 > "../packages/$name.tar.gz"
+            CGO_ENABLED=1 CGO_CPPFLAGS="-I$RUNNER_TEMP/spidermonkey/linux-amd64-gnu/include -I$RUNNER_TEMP/libwebp/linux-amd64-gnu/include" CGO_LDFLAGS="-L$RUNNER_TEMP/spidermonkey/linux-amd64-gnu/lib -L$RUNNER_TEMP/libwebp/linux-amd64-gnu/lib" \
+              go build -overlay ../overlay.json -mod=readonly -trimpath -tags desktop,production,gtk3 -ldflags="-s -w -extldflags -Wl,--gc-sections $link" -o bin/aistudio2api ./cmd/aistudio2api
+            bash build/linux/appimage.sh bin/aistudio2api "../packages/$name.AppImage"
+            VERSION="${version#v}" GOARCH=amd64 wails3 tool package -name aistudio2api -format deb -config build/linux/nfpm.yaml -out dist
+            mv dist/aistudio2api*.deb "../packages/$name.deb"
+          done
+          objdump -T bin/aistudio2api | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 > ../packages/desktop-glibc.txt
+          ls -l ../packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: packages
+          retention-days: 1
+
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解开 Lab 文件
+        run: node .github/lab.mjs open
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - name: 解压产品源码
+        run: |
+          mkdir product
+          tar -xzf product.tar.gz -C product
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: 构建前端
+        working-directory: product/web
+        run: |
+          npm ci
+          npx vp build
+      - uses: ./product/.github/actions/static-libraries
+        if: hashFiles('spidermonkey/*.tar.gz') == ''
+        with:
+          target: darwin-arm64
+      - uses: ./product/.github/actions/static-libraries
+        if: hashFiles('spidermonkey/*.tar.gz') == ''
+        with:
+          target: darwin-amd64
+      - name: 使用传入的 SpiderMonkey 静态库
+        if: hashFiles('spidermonkey/*.tar.gz') != ''
+        run: |
+          libwebp=$(sed -nE 's/^ *LIBWEBP: ([^ ]+)/\1/p' product/.github/actions/static-libraries/action.yml)
+          for target in darwin-arm64 darwin-amd64; do
+            mkdir -p "$RUNNER_TEMP/spidermonkey/$target" "$RUNNER_TEMP/libwebp/$target"
+            tar -xzf "spidermonkey/spidermonkey-$target.tar.gz" -C "$RUNNER_TEMP/spidermonkey/$target"
+            curl -fsSL "https://github.com/Mag1cFall/libwebp/releases/download/$libwebp/libwebp-$libwebp-$target.tar.gz" | tar -xz -C "$RUNNER_TEMP/libwebp/$target"
+          done
+      - name: 按 build.yml 打包 v0.0.1 与 v0.0.2
+        working-directory: product
+        env:
+          CGO_ENABLED: '1'
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: |
+          sed 's#https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest#http://127.0.0.1:2171/release.json#' internal/app/update.go > ../update.go
+          grep -q 127.0.0.1:2171 ../update.go
+          printf '{"Replace":{"%s":"%s"}}' "$PWD/internal/app/update.go" "$(cd .. && pwd)/update.go" > ../overlay.json
+          mkdir -p ../packages ../bin
+          for version in v0.0.1 v0.0.2; do
+            link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$version"
+            for arch in arm64 amd64; do
+              export GOARCH=$arch CGO_CPPFLAGS="-mmacosx-version-min=13.0 -I$RUNNER_TEMP/spidermonkey/darwin-$arch/include -I$RUNNER_TEMP/libwebp/darwin-$arch/include" CGO_LDFLAGS="-mmacosx-version-min=13.0 -L$RUNNER_TEMP/spidermonkey/darwin-$arch/lib -L$RUNNER_TEMP/libwebp/darwin-$arch/lib"
+              go build -overlay ../overlay.json -mod=readonly -trimpath -tags desktop,production -ldflags="-s -w -extldflags -Wl,-dead_strip $link" -o "../bin/desktop-$arch" ./cmd/aistudio2api
+              name="aistudio2api-$version-darwin-$arch"
+              mkdir -p "../bin/$name"
+              go build -overlay ../overlay.json -mod=readonly -trimpath -ldflags="-s -w -extldflags -Wl,-dead_strip $link" -o "../bin/$name/aistudio2api" ./cmd/aistudio2api
+              tar -cf - -C ../bin "$name" | gzip -9 > "../packages/$name.tar.gz"
+            done
+            app="../bin/$version/AIStudio2API.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            lipo -create -output "$app/Contents/MacOS/aistudio2api" ../bin/desktop-arm64 ../bin/desktop-amd64
+            cp build/darwin/icons.icns "$app/Contents/Resources/"
+            cp build/darwin/Info.plist "$app/Contents/"
+            plutil -replace CFBundleShortVersionString -string "${version#v}" "$app/Contents/Info.plist"
+            plutil -replace CFBundleVersion -string "${version#v}" "$app/Contents/Info.plist"
+            codesign --force --deep --sign - "$app"
+            codesign --verify --deep --strict "$app"
+            ditto -c -k --keepParent "$app" "../packages/aistudio2api-$version-darwin-universal.zip"
+          done
+          mkdir ../bin/dmg
+          cp -R ../bin/v0.0.1/AIStudio2API.app ../bin/dmg/
+          ln -s /Applications ../bin/dmg/Applications
+          for attempt in 1 2 3; do
+            hdiutil create -volname AIStudio2API -srcfolder ../bin/dmg -fs HFS+ -ov -format ULMO ../packages/aistudio2api-v0.0.1-darwin-universal.dmg && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 5
+          done
+          ls -l ../packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: packages
+          retention-days: 1
+
+  run-linux:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解开 Lab 文件
+        run: node .github/lab.mjs open
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: packages
+      - name: 命令行包
+        run: bash aistudio/runners/newuser/linux-flow.sh cli packages accounts/${{ matrix.runner }}/cli out/cli
+      - name: AppImage
+        if: always()
+        run: bash aistudio/runners/newuser/linux-flow.sh appimage packages accounts/${{ matrix.runner }}/appimage out/appimage
+      - name: deb
+        if: always()
+        run: bash aistudio/runners/newuser/linux-flow.sh deb packages accounts/${{ matrix.runner }}/deb out/deb
+      - name: 加密结果
+        if: always()
+        run: node .github/lab.mjs seal out sealed
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.runner }}
+          path: sealed
+          retention-days: 1
+
+  run-debian:
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:12
+      options: --privileged
+    timeout-minutes: 90
+    steps:
+      - name: 桌面系统基础工具
+        run: apt-get update && apt-get install -y --no-install-recommends sudo curl ca-certificates git python3 procps xz-utils nodejs fuse3
+      - name: 按 Debian 主机运行，去掉容器标记文件
+        run: rm -f /.dockerenv /run/.containerenv
+      - uses: actions/checkout@v4
+      - name: 解开 Lab 文件
+        run: node .github/lab.mjs open
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: packages
+      - name: 命令行包
+        run: bash aistudio/runners/newuser/linux-flow.sh cli packages accounts/debian-12/cli out/cli
+      - name: AppImage
+        if: always()
+        run: bash aistudio/runners/newuser/linux-flow.sh appimage packages accounts/debian-12/appimage out/appimage
+      - name: 加密结果
+        if: always()
+        run: node .github/lab.mjs seal out sealed
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debian-12
+          path: sealed
+          retention-days: 1
+
+  run-macos:
+    needs: build-macos
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解开 Lab 文件
+        run: node .github/lab.mjs open
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-packages
+          path: packages
+      - name: 桌面版
+        run: bash aistudio/runners/newuser/macos-flow.sh desktop packages accounts/macos/desktop out/desktop
+      - name: 命令行包
+        if: always()
+        run: bash aistudio/runners/newuser/macos-flow.sh cli packages accounts/macos/cli out/cli
+      - name: 加密结果
+        if: always()
+        run: node .github/lab.mjs seal out sealed
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.runner }}
+          path: sealed
+          retention-days: 1
